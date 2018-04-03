@@ -1,13 +1,31 @@
 library(tidyverse)
 library(lubridate)
-library(zoo)
+library(patchwork)
+library(RcppRoll)
 
 soccer_spi <- read_csv("https://projects.fivethirtyeight.com/soccer-api/club/spi_matches.csv") %>% 
   mutate(
     probmax = pmax(prob1, prob2, probtie, na.rm = T),
     probres = if_else(probmax == prob1, "1", if_else(probmax == probtie, "X", "2")),
-    season = if_else(date < dmy("01-06-17"), 1617, 1718)
-  ) 
+    season = if_else(date < dmy("01-06-17"), 1617, 1718),
+    res = if_else(score1 > score2, "1", if_else(score1 < score2, "2", "X")),
+    corr = if_else(probres == res, 1, 0),
+    point1 = if_else(res == 1, 3, if_else(res == "X", 1, 0)),
+    point2 = if_else(res == 2, 3, if_else(res == "X", 1, 0))
+  ) %>% 
+  group_by(team1) %>% 
+  mutate(
+    streak_home = roll_sum(point1, 5, align = "right", fill = NA)
+  ) %>% 
+  fill(streak_home) %>% 
+  ungroup() %>% 
+  group_by(team2) %>% 
+  mutate(
+    streak_away = roll_sum(point2, 5, align = "right", fill = NA)
+  ) %>% 
+  fill(streak_away) %>% 
+  ungroup()
+
 
 # Liganavne ----------------------------------------
 
@@ -55,6 +73,9 @@ match_compl <- soccer_spi %>%
     corr = if_else(probres == res, 1, 0)
   )
 
+
+# Sandsynlighedstest ------------------------------------------------------
+
 ssh <- match_compl %>% 
   mutate(
     probround = floor(probmax*20)/20
@@ -80,27 +101,152 @@ match_upcom <- soccer_spi %>%
   select(-starts_with("score"), -contains("xg"), -starts_with("adj")) %>% 
   arrange(league_id, date)
 
+# Vinderkampe -------------------------------------------------------------
+
 winner <- match_upcom %>%
   filter(date < ceiling_date(today(), "week", week_start = 1) & probmax >= 0.6) %>%
   arrange(-probmax) %>%
-  select(-league_id) %>%
-  View("Vinder kampe!")
+  select(-league_id, -res, -corr, -season, -contains("point"))
 
-
+View(winner)
 
 
 # Adjusted point ----------------------------------------------------------
 
+match_adj <- tibble(
+  date = today(),
+  team = character(),
+  opp = character(),
+  score_t = integer(),
+  score_o = integer(),
+  point_t = integer(),
+  point_o = integer(),
+  xg_t = numeric(),
+  xg_o = numeric(),
+  xg_point_t = integer(),
+  xg_point_o = integer(),
+  diff_t = integer(),
+  diff_o = integer(),
+  diff_score_t = numeric(),
+  diff_score_o = numeric(),
+  forskel = integer()     
+)
+
+for (j in seq_along(unique(match_compl$team1))) {
+  team <- unique(match_compl$team1)[j]
+  adj_data <- match_compl %>% 
+    filter(team1 == team | team2 == team) %>% 
+    transmute(
+      date = date,
+      league = league,
+      season = season,
+      team = if_else(team1 == team, team1, team2),
+      opp = if_else(team1 == team, team2, team1),
+      score_t = if_else(team1 == team, score1, score2),
+      score_o = if_else(team1 == team, score2, score1),
+      point_t = if_else(score_t > score_o, 3, if_else(score_t < score_o, 0, 1)),
+      point_o = if_else(score_t < score_o, 3, if_else(score_t > score_o, 0, 1)),
+      xg_t = if_else(probmax == prob1, xg1, xg2),
+      xg_o = if_else(probmax == prob1, xg2, xg1),
+      xg_point_t = if_else(xg_t > xg_o, 3, if_else(xg_t < xg_o, 0, 1)),
+      xg_point_o = if_else(xg_t < xg_o, 3, if_else(xg_t > xg_o, 0, 1)),
+      diff_t = point_t - xg_point_t,
+      diff_o = point_o - xg_point_o,
+      diff_score_t = score_t - xg_t,
+      diff_score_o = score_o - xg_o
+    )
+  match_adj <- bind_rows(match_adj, adj_data)
+}
+
+ggplot(match_adj %>% filter(team == "Manchester United", date > dmy("01062017"), league == "England: Premier League") %>% arrange(date)) + 
+  geom_step(aes(date, cumsum(point_t)), color = "steelblue") + 
+  geom_step(aes(date, cumsum(xg_point_t)), color = "red")
+  
+
+adj_func <- function(team, leagueid) {
+  adj_data <- match_compl %>% 
+    filter(team1 == team | team2 == team) %>% 
+    transmute(
+      date = date,
+      league_id = league_id,
+      season = season,
+      team = if_else(team1 == team, team1, team2),
+      opp = if_else(team1 == team, team2, team1),
+      score_t = if_else(team1 == team, score1, score2),
+      score_o = if_else(team1 == team, score2, score1),
+      point_t = if_else(score_t > score_o, 3, if_else(score_t < score_o, 0, 1)),
+      point_o = if_else(score_t < score_o, 3, if_else(score_t > score_o, 0, 1)),
+      xg_score_t = if_else(probmax == prob1, xg1, xg2),
+      xg_score_o = if_else(probmax == prob1, xg2, xg1),
+      xg_point_t = if_else(xg_score_t > xg_score_o, 3, if_else(xg_score_t < xg_score_o, 0, 1)),
+      xg_point_o = if_else(xg_score_t < xg_score_o, 3, if_else(xg_score_t > xg_score_o, 0, 1)),
+      diff_point_t = point_t - xg_point_t,
+      diff_point_o = point_o - xg_point_o,
+      diff_score_t = score_t - xg_score_t,
+      diff_score_o = score_o - xg_score_o
+    ) %>% 
+    filter(season == 1718, league_id == leagueid) %>% 
+    arrange(date)
+  
+  p_point <- ggplot(adj_data %>% 
+                      select(date, point_t, xg_point_t) %>% 
+                      arrange(date) %>% 
+                      mutate_if(is.numeric, cumsum) %>% 
+                      gather(contains("point"), key = "type", value = "point")
+                    ) + 
+    geom_step(aes(date, point, color = type, lty = type), size = 1) + 
+    scale_color_brewer(palette = "Set1") + 
+    theme_minimal(11) +
+    theme(legend.position = "bottom") +
+    labs(caption = "Samlet point", x = "Dato", y = "Kummuleret point")
+  
+  p_score_t <- ggplot(adj_data %>% 
+                        select(date, score_t, xg_score_t) %>% 
+                        arrange(date) %>% 
+                        mutate_if(is.numeric, cumsum) %>% 
+                        gather(contains("score"), key = "type", value = "score")
+                      ) + 
+    geom_step(aes(date, score, color = type, lty = type), size = 1) + 
+    scale_color_brewer(palette = "Set1") +
+    theme_minimal(9) +
+    theme(legend.position = "None") +
+    labs(caption = "Angreb", x = "Dato", y = "Kummuleret scoret mål")
+  
+  p_score_o <- ggplot(adj_data %>% 
+                        select(date, score_o, xg_score_o) %>% 
+                        arrange(date) %>% 
+                        mutate_if(is.numeric, cumsum) %>% 
+                        gather(contains("score"), key = "type", value = "score")
+                      ) + 
+    geom_step(aes(date, score, color = type, lty = type), size = 1) +
+    scale_color_brewer(palette = "Set1") +
+    theme_minimal(9) +
+    theme(legend.position = "None") +
+    labs(caption = "Forsvar", x = "Dato", y = "Kummuleret indkasseret mål")
+  
+  (p_score_t | p_score_o ) / p_point
+
+}
+
 match_adj <- match_compl %>% 
-  filter(league == "England: Premier League", season == 1718, probmax != probtie) %>% 
-  mutate(
+  filter(league == "England: Premier League", season == 1718) %>% 
+  filter(team1 == team | team2 == team) %>% 
+  transmute(
     date = date,
-    team = if_else(probmax == prob1, team1, team2),
-    opp = if_else(probmax == prob1, team2, team1),
-    score_t = if_else(probmax == prob1, score1, score2),
-    score_o = if_else(probmax == prob1, score2, score1),
+    team = if_else(team1 == team, team1, team2),
+    opp = if_else(team1 == team, team2, team1),
+    score_t = if_else(team1 == team, score1, score2),
+    score_o = if_else(team1 == team, score2, score1),
+    point_t = if_else(score_t > score_o, 3, if_else(score_t < score_o, 0, 1)),
+    point_o = if_else(score_t < score_o, 3, if_else(score_t > score_o, 0, 1)),
     xg_t = if_else(probmax == prob1, xg1, xg2),
-    xg_o = if_else(probmax == prob1, xg2, xg1)
+    xg_o = if_else(probmax == prob1, xg2, xg1),
+    xg_point_t = if_else(xg_t > xg_o, 3, if_else(xg_t < xg_o, 0, 1)),
+    xg_point_o = if_else(xg_t < xg_o, 3, if_else(xg_t > xg_o, 0, 1)),
+    diff_t = point_t - xg_point_t,
+    diff_o = point_o - xg_point_o,
+    diff_score_t = score_t - xg_t,
+    diff_score_o = score_o - xg_o
   )
 
 
@@ -131,3 +277,44 @@ ggplot(adj_xg) +
 
 ggplot(adj_xg, aes(date, ((team_g-team_xg)-(opp_xg-opp_g)))) +
   geom_step()
+
+
+# top 6 PL analyse --------------------------------------------------------
+
+top6 <- c(
+  "Manchester United",
+  "Chelsea",
+  "Arsenal",
+  "Tottenham Hotspur",
+  "Manchester City",
+  "Liverpool"
+)
+
+match_top6_score <- match_compl %>% 
+  filter(team1 %in% top6 & team2 %in% top6, season == 1718) %>% 
+  select(team1, team2, score1, score2) %>% 
+  unite("score", score1, score2, sep="-") %>% 
+  spread(key = team2, value = score)
+
+top6_point <- match_compl %>% 
+  filter(team1 %in% top6 & team2 %in% top6, season == 1718) %>% 
+  select(team1, team2, point1, point2)
+
+home_top6_point <- top6_point %>% 
+  select(team1, point1) %>% 
+  group_by(team1) %>% 
+  summarise(home_point = sum(point1), home_games = n())
+
+away_top6_point <- top6_point %>% 
+  select(team2, point2) %>% 
+  group_by(team2) %>% 
+  summarise(away_point = sum(point2), away_games = n())
+
+top6point <- left_join(home_top6_point, away_top6_point, c("team1" = "team2")) %>% 
+  mutate(sum_point = home_point + away_point)
+
+
+# running point -----------------------------------------------------------
+
+manudt_h <- soccer_spi %>% filter(team1 == "Manchester United") %>% arrange(league_id, date)
+manudt_a <- soccer_spi %>% filter(team2 == "Manchester United") %>% arrange(league_id, date)
